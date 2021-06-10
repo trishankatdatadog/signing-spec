@@ -2,71 +2,35 @@ r"""Reference implementation of signing-spec.
 
 Copyright 2021 Google LLC.
 SPDX-License-Identifier: Apache-2.0
-
-The following example requires `pip3 install pycryptodome` and uses ecdsa.py in
-the same directory as this file.
-
->>> import os, sys
->>> from pprint import pprint
->>> sys.path.insert(0, os.path.dirname(__file__))
->>> import ecdsa
-
->>> signer = ecdsa.Signer.construct(
-...     curve='P-256',
-...     d=97358161215184420915383655311931858321456579547487070936769975997791359926199,
-...     point_x=46950820868899156662930047687818585632848591499744589407958293238635476079160,
-...     point_y=5640078356564379163099075877009565129882514886557779369047442380624545832820)
->>> verifier = ecdsa.Verifier(signer.public_key)
->>> payloadType = 'http://example.com/HelloWorld'
->>> payload = b'hello world'
-
-Signing example:
-
->>> signature_json = Sign(payloadType, payload, signer)
->>> pprint(json.loads(signature_json))
-{'payload': 'aGVsbG8gd29ybGQ=',
- 'payloadType': 'http://example.com/HelloWorld',
- 'signatures': [{'sig': 'A3JqsQGtVsJ2O2xqrI5IcnXip5GToJ3F+FnZ+O88SjtR6rDAajabZKciJTfUiHqJPcIAriEGAHTVeCUjW2JIZA=='}]}
-
-Verification example:
-
->>> result = Verify(signature_json, [('mykey', verifier)])
->>> pprint(result)
-VerifiedPayload(payloadType='http://example.com/HelloWorld', payload=b'hello world', recognizedSigners=['mykey'])
-
-PAE:
-
->>> PAE(payloadType, payload)
-b'DSSEv1 29 http://example.com/HelloWorld 11 hello world'
 """
 
 import base64, binascii, dataclasses, json, struct
 
 # Protocol requires Python 3.8+.
-from typing import Iterable, List, Protocol, Tuple
+from typing import Dict, List, Protocol, Set
 
 
 class Signer(Protocol):
-    def sign(self, message: bytes) -> bytes:
-        """Returns the signature of `message`."""
+    def sign(self, message: bytes) -> tuple[str, bytes]:
+        """Returns the keyid of the signer, and the signature of `message`."""
         ...
 
 
 class Verifier(Protocol):
-    def verify(self, message: bytes, signature: bytes) -> bool:
+    def verify(self, message: bytes, keyid: str, signature: bytes) -> bool:
         """Returns true if `message` was signed by `signature`."""
         ...
 
 
-# Collection of verifiers, each of which is associated with a name.
-VerifierList = Iterable[Tuple[str, Verifier]]
+# Collection of verifiers, each of which is associated with a keyid.
+Verifiers = Dict[str, Verifier]
 
 
 @dataclasses.dataclass
 class VerifiedPayload:
     payloadType: str
     payload: bytes
-    recognizedSigners: List[str]  # List of names of signers
+    recognizedSigners: Set[str]  # Set of keyids of signers
 
 
 def b64enc(m: bytes) -> str:
@@ -88,27 +52,28 @@ def PAE(payloadType: str, payload: bytes) -> bytes:
 
 
 def Sign(payloadType: str, payload: bytes, signer: Signer) -> str:
+    keyid, sig = signer.sign(PAE(payloadType, payload))
     return json.dumps({
-        'payload':
-        b64enc(payload),
-        'payloadType':
-        payloadType,
+        'payload': b64enc(payload),
+        'payloadType': payloadType,
         'signatures': [{
-            'sig': b64enc(signer.sign(PAE(payloadType, payload)))
+            'keyid': keyid,
+            'sig': b64enc(sig),
         }],
     })
 
 
-def Verify(json_signature: str, verifiers: VerifierList) -> VerifiedPayload:
+def Verify(json_signature: str, verifiers: Verifiers) -> VerifiedPayload:
     wrapper = json.loads(json_signature)
     payloadType = wrapper['payloadType']
     payload = b64dec(wrapper['payload'])
     pae = PAE(payloadType, payload)
-    recognizedSigners = []
+    recognizedSigners = set()
     for signature in wrapper['signatures']:
-        for name, verifier in verifiers:
-            if verifier.verify(pae, b64dec(signature['sig'])):
-                recognizedSigners.append(name)
+        keyid, sig = signature['keyid'], signature['sig']
+        verifier = verifiers.get(keyid)
+        if verifier and verifier.verify(pae, keyid, b64dec(sig)):
+            recognizedSigners.add(keyid)
     if not recognizedSigners:
         raise ValueError('No valid signature found')
     return VerifiedPayload(payloadType, payload, recognizedSigners)
